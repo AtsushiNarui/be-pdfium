@@ -4,7 +4,11 @@
 
 #include "public/fpdf_annot.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstring>
+#include <iomanip>
 #include <memory>
 #include <sstream>
 #include <utility>
@@ -28,6 +32,7 @@
 #include "core/fpdfapi/parser/fpdf_parser_utility.h"
 #include "core/fpdfdoc/cpdf_annot.h"
 #include "core/fpdfdoc/cpdf_color_utils.h"
+#include "core/fpdfdoc/cpdf_filespec.h"
 #include "core/fpdfdoc/cpdf_formfield.h"
 #include "core/fpdfdoc/cpdf_generateap.h"
 #include "core/fpdfdoc/cpdf_interactiveform.h"
@@ -241,6 +246,296 @@ void UpdateBBox(CPDF_Dictionary* annot_dict) {
       pStream->GetMutableDict()->SetRectFor("BBox", boundingRect);
     }
   }
+}
+
+bool IsVideoMimeSubtype(const ByteString& subtype) {
+  ByteString mime = subtype;
+  mime.MakeLower();
+  return mime.GetLength() >= 5 && mime.First(5) == "video";
+}
+
+RetainPtr<const CPDF_Stream> GetFileStreamFromAsset(
+    const CPDF_Object* asset,
+    ByteString* source_out = nullptr) {
+  if (!asset) {
+    return nullptr;
+  }
+
+  if (source_out) {
+    *source_out = ByteString();
+  }
+
+  CPDF_FileSpec file_spec(pdfium::WrapRetain(asset));
+  RetainPtr<const CPDF_Stream> file_stream = file_spec.GetFileStream();
+  if (file_stream) {
+    if (source_out) {
+      *source_out = ByteString("FileSpec");
+    }
+    return file_stream;
+  }
+
+  if (asset->IsStream()) {
+    if (source_out) {
+      *source_out = ByteString("DirectStream");
+    }
+    return pdfium::WrapRetain(asset->AsStream());
+  }
+
+  const CPDF_Dictionary* dict = asset->AsDictionary();
+  if (!dict) {
+    return nullptr;
+  }
+
+  RetainPtr<const CPDF_Dictionary> ef_dict = dict->GetDictFor("EF");
+  if (!ef_dict) {
+    return nullptr;
+  }
+
+  CPDF_DictionaryLocker locker(ef_dict);
+  for (auto it = locker.begin(); it != locker.end(); ++it) {
+    RetainPtr<const CPDF_Stream> stream =
+        ef_dict->GetStreamFor(it->first.AsStringView());
+    if (stream) {
+      if (source_out) {
+        *source_out = ByteString("EF:") + it->first.AsStringView();
+      }
+      return stream;
+    }
+  }
+
+  return nullptr;
+}
+
+ByteString HexPreview(ByteStringView bytes, size_t max_count) {
+  fxcrt::ostringstream hex;
+  size_t limit = std::min(bytes.GetLength(), max_count);
+  for (size_t i = 0; i < limit; ++i) {
+    int value = static_cast<ByteStringView::UnsignedType>(bytes[i]);
+    hex << std::hex << std::setw(2) << std::setfill('0') << std::nouppercase
+        << value;
+    if (i + 1 < limit) {
+      hex << " ";
+    }
+  }
+  if (bytes.GetLength() > limit) {
+    hex << " ...";
+  }
+  return ByteString(hex);
+}
+
+ByteString DescribeStreamDebug(const CPDF_Stream* stream,
+                               ByteStringView source) {
+  if (!stream) {
+    return ByteString("stream=none");
+  }
+
+  int dict_length =
+      stream->GetDict() ? stream->GetDict()->GetIntegerFor("Length") : -1;
+  size_t raw_size = stream->GetRawSize();
+
+  fxcrt::ostringstream desc;
+  desc << "stream";
+  if (!source.IsEmpty()) {
+    desc << " src=" << source;
+  }
+  if (dict_length >= 0) {
+    desc << " len=" << dict_length;
+  }
+  if (raw_size > 0) {
+    desc << " raw=" << raw_size;
+  }
+  if (dict_length < 0 && raw_size == 0) {
+    desc << " (empty?)";
+  }
+  return ByteString(desc);
+}
+
+bool IsVideoFileSpec(CPDF_Object* asset) {
+  if (!asset) {
+    return false;
+  }
+
+  CPDF_FileSpec file_spec(pdfium::WrapRetain<const CPDF_Object>(asset));
+  RetainPtr<const CPDF_Stream> file_stream = GetFileStreamFromAsset(asset);
+  if (!file_stream) {
+    return false;
+  }
+
+  RetainPtr<const CPDF_Dictionary> file_dict = file_stream->GetDict();
+  if (file_dict && IsVideoMimeSubtype(file_dict->GetByteStringFor("Subtype"))) {
+    return true;
+  }
+
+  RetainPtr<const CPDF_Dictionary> params_dict = file_spec.GetParamsDict();
+  return params_dict &&
+         IsVideoMimeSubtype(params_dict->GetByteStringFor("Subtype"));
+}
+
+void CollectNameTreeValues(
+    CPDF_Dictionary* node,
+    std::vector<RetainPtr<CPDF_Object>>* assets_out) {
+  if (!node || !assets_out) {
+    return;
+  }
+
+  RetainPtr<CPDF_Array> names = node->GetMutableArrayFor("Names");
+  if (names) {
+    for (size_t i = 0; i + 1 < names->size(); i += 2) {
+      assets_out->push_back(names->GetMutableDirectObjectAt(i + 1));
+    }
+  }
+
+  RetainPtr<CPDF_Array> kids = node->GetMutableArrayFor("Kids");
+  if (!kids) {
+    return;
+  }
+
+  for (size_t i = 0; i < kids->size(); ++i) {
+    CollectNameTreeValues(
+        ToDictionary(kids->GetMutableDirectObjectAt(i)).Get(), assets_out);
+  }
+}
+
+void AppendIndent(fxcrt::ostringstream* stream, size_t depth) {
+  if (!stream) {
+    return;
+  }
+  for (size_t i = 0; i < depth; ++i) {
+    *stream << "  ";
+  }
+}
+
+ByteString DescribeNameTreeValueForDebug(const CPDF_Object* asset) {
+  if (!asset) {
+    return ByteString("null");
+  }
+
+  const char* type = "unknown";
+  if (asset->IsDictionary()) {
+    type = "dict";
+  } else if (asset->IsStream()) {
+    type = "stream";
+  } else if (asset->IsArray()) {
+    type = "array";
+  } else if (asset->IsName()) {
+    type = "name";
+  } else if (asset->IsString()) {
+    type = "string";
+  } else if (asset->IsNumber()) {
+    type = "number";
+  } else if (asset->IsReference()) {
+    type = "reference";
+  }
+
+  CPDF_FileSpec file_spec(pdfium::WrapRetain(asset));
+  WideString file_name = file_spec.GetFileName();
+  ByteString file_name_utf8 = file_name.ToUTF8();
+
+  ByteString subtype;
+  RetainPtr<const CPDF_Stream> file_stream = GetFileStreamFromAsset(asset);
+  if (file_stream && file_stream->GetDict()) {
+    subtype = file_stream->GetDict()->GetByteStringFor("Subtype");
+  }
+  if (subtype.IsEmpty()) {
+    RetainPtr<const CPDF_Dictionary> params_dict = file_spec.GetParamsDict();
+    if (params_dict) {
+      subtype = params_dict->GetByteStringFor("Subtype");
+    }
+  }
+
+  fxcrt::ostringstream debug_info;
+  debug_info << type;
+  if (!file_name_utf8.IsEmpty()) {
+    debug_info << " name=\"" << file_name_utf8.AsStringView() << "\"";
+  }
+  if (!subtype.IsEmpty()) {
+    debug_info << " subtype=\"" << subtype.AsStringView() << "\"";
+  }
+  return ByteString(debug_info);
+}
+
+#if DCHECK_IS_ON()
+ByteString DescribeAttachmentStreamForDebug(const CPDF_Object* fs_obj) {
+  ByteString source;
+  RetainPtr<const CPDF_Stream> stream = GetFileStreamFromAsset(fs_obj, &source);
+  if (!stream) {
+    return ByteString("stream=none");
+  }
+
+  CPDF_FileSpec file_spec(pdfium::WrapRetain(fs_obj));
+  ByteString name_utf8 = file_spec.GetFileName().ToUTF8();
+
+  int dict_length =
+      stream->GetDict() ? stream->GetDict()->GetIntegerFor("Length") : -1;
+  size_t raw_size = stream->GetRawSize();
+
+  fxcrt::ostringstream desc;
+  desc << "stream";
+  if (!source.IsEmpty()) {
+    desc << " src=" << source;
+  }
+  if (!name_utf8.IsEmpty()) {
+    desc << " name=\"" << name_utf8.AsStringView() << "\"";
+  }
+  if (dict_length >= 0) {
+    desc << " len=" << dict_length;
+  }
+  if (raw_size > 0) {
+    desc << " raw=" << raw_size;
+  }
+  return ByteString(desc);
+}
+#endif  // DCHECK_IS_ON()
+
+void DumpNameTreeForDebug(CPDF_Dictionary* node,
+                          size_t depth,
+                          fxcrt::ostringstream* stream) {
+  if (!node || !stream) {
+    return;
+  }
+
+  RetainPtr<CPDF_Array> names = node->GetMutableArrayFor("Names");
+  if (names) {
+    for (size_t i = 0; i + 1 < names->size(); i += 2) {
+      ByteString raw_name = names->GetByteStringAt(i);
+      WideString decoded_name = PDF_DecodeText(raw_name.unsigned_span());
+      ByteString name_utf8 = decoded_name.ToUTF8();
+      const ByteString& printable_name =
+          name_utf8.IsEmpty() ? raw_name : name_utf8;
+      ByteString raw_hex = HexPreview(raw_name.AsStringView(), 64);
+
+      RetainPtr<CPDF_Object> value = names->GetMutableDirectObjectAt(i + 1);
+      ByteString stream_source;
+      RetainPtr<const CPDF_Stream> asset_stream =
+          GetFileStreamFromAsset(value.Get(), &stream_source);
+      AppendIndent(stream, depth);
+      *stream << "+name[" << i / 2 << "]: \"" << printable_name.AsStringView()
+              << "\" raw=[" << raw_hex.AsStringView()
+              << "] -> " << DescribeNameTreeValueForDebug(value.Get()) << " "
+              << DescribeStreamDebug(asset_stream.Get(),
+                                     stream_source.AsStringView())
+              << "\n";
+    }
+  }
+
+  RetainPtr<CPDF_Array> kids = node->GetMutableArrayFor("Kids");
+  if (!kids) {
+    return;
+  }
+
+  for (size_t i = 0; i < kids->size(); ++i) {
+    RetainPtr<CPDF_Dictionary> kid =
+        ToDictionary(kids->GetMutableDirectObjectAt(i));
+    AppendIndent(stream, depth);
+    *stream << "kid[" << i << "]\n";
+    DumpNameTreeForDebug(kid.Get(), depth + 1, stream);
+  }
+}
+
+ByteString GetNameTreeDebugString(CPDF_Dictionary* root) {
+  fxcrt::ostringstream stream;
+  DumpNameTreeForDebug(root, 0, &stream);
+  return ByteString(stream);
 }
 
 const CPDF_Dictionary* GetAnnotDictFromFPDFAnnotation(
@@ -1737,8 +2032,18 @@ FPDFAnnot_GetFileAttachment(FPDF_ANNOTATION annot) {
     return nullptr;
   }
 
-  return FPDFAttachmentFromCPDFObject(
-      annot_dict->GetMutableDirectObjectFor("FS"));
+  RetainPtr<CPDF_Object> fs_obj =
+      annot_dict->GetMutableDirectObjectFor("FS");
+  if (!fs_obj) {
+    return nullptr;
+  }
+
+#if DCHECK_IS_ON()
+  ByteString stream_debug = DescribeAttachmentStreamForDebug(fs_obj.Get());
+  fprintf(stderr, "FileAttachment debug: %s\n", stream_debug.c_str());
+#endif
+
+  return FPDFAttachmentFromCPDFObject(fs_obj.Get());
 }
 
 FPDF_EXPORT FPDF_ATTACHMENT FPDF_CALLCONV
@@ -1772,4 +2077,197 @@ FPDFAnnot_AddFileAttachment(FPDF_ANNOTATION annot, FPDF_WIDESTRING name) {
 
   annot_dict->SetNewFor<CPDF_Reference>("FS", doc, fs_obj->GetObjNum());
   return FPDFAttachmentFromCPDFObject(fs_obj);
+}
+
+extern "C" FPDF_EXPORT FPDF_ATTACHMENT FPDF_CALLCONV
+FPDFAnnot_GetRichMediaAssetAttachment(FPDF_PAGE page, int annot_index) {
+  if (annot_index < 0) {
+    return nullptr;
+  }
+
+  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
+  if (!pdf_page) {
+    return nullptr;
+  }
+
+  RetainPtr<CPDF_Array> annots = pdf_page->GetMutableAnnotsArray();
+  if (!annots || static_cast<size_t>(annot_index) >= annots->size()) {
+    return nullptr;
+  }
+
+  RetainPtr<CPDF_Dictionary> annot_dict =
+      ToDictionary(annots->GetMutableDirectObjectAt(annot_index));
+  if (!annot_dict) {
+    return nullptr;
+  }
+
+  if (CPDF_Annot::StringToAnnotSubtype(
+          annot_dict->GetNameFor(pdfium::annotation::kSubtype)) !=
+      CPDF_Annot::Subtype::RICHMEDIA) {
+    return nullptr;
+  }
+
+  RetainPtr<CPDF_Dictionary> rich_media_dict =
+      annot_dict->GetMutableDictFor("RichMedia");
+  if (!rich_media_dict) {
+    rich_media_dict = annot_dict->GetMutableDictFor("RichMediaContent");
+  }
+  RetainPtr<CPDF_Dictionary> assets_dict =
+      rich_media_dict ? rich_media_dict->GetMutableDictFor("Assets")
+                      : nullptr;
+  if (!assets_dict) {
+    return nullptr;
+  }
+
+#if DCHECK_IS_ON()
+  ByteString name_tree_dump = GetNameTreeDebugString(assets_dict.Get());
+  if (!name_tree_dump.IsEmpty()) {
+    fprintf(stderr,
+            "RichMedia assets NameTree dump for annot_index=%d\n%s",
+            annot_index, name_tree_dump.c_str());
+  }
+#endif
+
+  std::vector<RetainPtr<CPDF_Object>> assets;
+  CollectNameTreeValues(assets_dict.Get(), &assets);
+  RetainPtr<CPDF_Object> fallback_asset;
+  RetainPtr<CPDF_Object> fallback_asset_with_stream;
+  for (const RetainPtr<CPDF_Object>& asset : assets) {
+    if (!asset) {
+      continue;
+    }
+
+    if (IsVideoFileSpec(asset.Get())) {
+      return FPDFAttachmentFromCPDFObject(asset.Get());
+    }
+
+    if (!fallback_asset) {
+      fallback_asset = asset;
+    }
+
+    if (!fallback_asset_with_stream &&
+        GetFileStreamFromAsset(asset.Get())) {
+      fallback_asset_with_stream = asset;
+    }
+  }
+
+  if (fallback_asset_with_stream) {
+    return FPDFAttachmentFromCPDFObject(fallback_asset_with_stream.Get());
+  }
+
+  if (!fallback_asset && !assets.empty()) {
+    fallback_asset = assets.front();
+  }
+
+  return fallback_asset ? FPDFAttachmentFromCPDFObject(fallback_asset.Get())
+                        : nullptr;
+}
+
+extern "C" FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFAnnot_DumpRichMediaAssetsNameTree(FPDF_PAGE page, int annot_index) {
+  if (annot_index < 0) {
+    return false;
+  }
+
+  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
+  if (!pdf_page) {
+    return false;
+  }
+
+  RetainPtr<CPDF_Array> annots = pdf_page->GetMutableAnnotsArray();
+  if (!annots || static_cast<size_t>(annot_index) >= annots->size()) {
+    return false;
+  }
+
+  RetainPtr<CPDF_Dictionary> annot_dict =
+      ToDictionary(annots->GetMutableDirectObjectAt(annot_index));
+  if (!annot_dict) {
+    return false;
+  }
+
+  if (CPDF_Annot::StringToAnnotSubtype(
+          annot_dict->GetNameFor(pdfium::annotation::kSubtype)) !=
+      CPDF_Annot::Subtype::RICHMEDIA) {
+    return false;
+  }
+
+  RetainPtr<CPDF_Dictionary> rich_media_dict =
+      annot_dict->GetMutableDictFor("RichMedia");
+  if (!rich_media_dict) {
+    rich_media_dict = annot_dict->GetMutableDictFor("RichMediaContent");
+  }
+  RetainPtr<CPDF_Dictionary> assets_dict =
+      rich_media_dict ? rich_media_dict->GetMutableDictFor("Assets")
+                      : nullptr;
+  if (!assets_dict) {
+    return false;
+  }
+
+  ByteString name_tree_dump = GetNameTreeDebugString(assets_dict.Get());
+  if (name_tree_dump.IsEmpty()) {
+    return false;
+  }
+
+  fprintf(stderr,
+          "RichMedia assets NameTree dump for annot_index=%d\n%s",
+          annot_index, name_tree_dump.c_str());
+  return true;
+}
+
+extern "C" FPDF_EXPORT unsigned long FPDF_CALLCONV
+FPDFAnnot_GetRichMediaAssetsNameTree(FPDF_PAGE page,
+                                     int annot_index,
+                                     char* buffer,
+                                     unsigned long buflen) {
+  if (annot_index < 0) {
+    return 0;
+  }
+
+  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
+  if (!pdf_page) {
+    return 0;
+  }
+
+  RetainPtr<CPDF_Array> annots = pdf_page->GetMutableAnnotsArray();
+  if (!annots || static_cast<size_t>(annot_index) >= annots->size()) {
+    return 0;
+  }
+
+  RetainPtr<CPDF_Dictionary> annot_dict =
+      ToDictionary(annots->GetMutableDirectObjectAt(annot_index));
+  if (!annot_dict) {
+    return 0;
+  }
+
+  if (CPDF_Annot::StringToAnnotSubtype(
+          annot_dict->GetNameFor(pdfium::annotation::kSubtype)) !=
+      CPDF_Annot::Subtype::RICHMEDIA) {
+    return 0;
+  }
+
+  RetainPtr<CPDF_Dictionary> rich_media_dict =
+      annot_dict->GetMutableDictFor("RichMedia");
+  if (!rich_media_dict) {
+    rich_media_dict = annot_dict->GetMutableDictFor("RichMediaContent");
+  }
+  RetainPtr<CPDF_Dictionary> assets_dict =
+      rich_media_dict ? rich_media_dict->GetMutableDictFor("Assets")
+                      : nullptr;
+  if (!assets_dict) {
+    return 0;
+  }
+
+  ByteString name_tree_dump = GetNameTreeDebugString(assets_dict.Get());
+  const size_t dump_len = name_tree_dump.GetLength();
+  const unsigned long required =
+      pdfium::checked_cast<unsigned long>(dump_len + 1);
+  if (!buffer || buflen == 0) {
+    return required;
+  }
+
+  size_t copy_len = std::min(static_cast<size_t>(buflen - 1), dump_len);
+  // SAFETY: required from caller.
+  memcpy(UNSAFE_BUFFERS(buffer), name_tree_dump.c_str(), copy_len);
+  buffer[copy_len] = '\0';
+  return required;
 }

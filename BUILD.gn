@@ -127,8 +127,18 @@ config("pdfium_common_config") {
 }
 
 config("pdfium_implementation_config") {
-  defines = [ "FPDF_IMPLEMENTATION" ]
-  visibility = [ ":pdfium_public_headers" ]
+  defines = [
+    "FPDF_IMPLEMENTATION",
+    "FPDF_EXPORT=__declspec(dllexport)",
+    "FPDF_CALLCONV=__stdcall",
+  ]
+  if (is_win) {
+    defines += [ "FPDFSDK_EXPORTS" ]
+  }
+  visibility = [
+    ":pdfium_public_headers",
+    ":pdfium",
+  ]
 }
 
 config("pdfium_public_config") {
@@ -226,7 +236,10 @@ group("pdfium_public_headers") {
 component("pdfium") {
   output_name = "pdfium"
   libs = []
-  configs += [ ":pdfium_strict_config" ]
+  configs += [
+    ":pdfium_strict_config",
+    ":pdfium_implementation_config",  # Exports FPDF_* APIs when building the DLL.
+  ]
   public_configs = [ ":pdfium_public_config" ]
 
   deps = [
@@ -275,6 +288,15 @@ component("pdfium") {
     complete_static_lib = true
     configs -= [ "//build/config/compiler:thin_archive" ]
   }
+}
+
+# Wrapper shared library to emit be-pdfium.dll/.so while keeping pdfium itself
+# as a non-component target (source_set/static lib when !is_component_build).
+shared_library("be_pdfium_dll") {
+  output_name = "be-pdfium"
+  deps = [ ":pdfium" ]
+  configs += [ ":pdfium_strict_config" ]
+  public_configs = [ ":pdfium_public_config" ]
 }
 
 # Targets below this are only visible within this file.

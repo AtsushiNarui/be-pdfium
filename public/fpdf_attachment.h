@@ -189,6 +189,49 @@ FPDFAttachment_GetSubtype(FPDF_ATTACHMENT attachment,
                           FPDF_WCHAR* buffer,
                           unsigned long buflen);
 
+// Experimental API.
+// Get the RichMedia asset attachment from the annotation at |annot_index| on
+// |page|. Video assets are preferred; if none are found, the first available
+// asset stream is returned. The returned handle remains valid while the parent
+// document is open (i.e. until FPDFDoc_Close()).
+//
+//   page         - handle to a page.
+//   annot_index  - zero-based annotation index on |page|.
+//
+// Returns the attachment handle, or NULL on failure.
+FPDF_EXPORT FPDF_ATTACHMENT FPDF_CALLCONV
+FPDFAnnot_GetRichMediaAssetAttachment(FPDF_PAGE page, int annot_index);
+
+// Experimental API.
+// Dump the RichMedia Assets NameTree for the annotation at |annot_index| on
+// |page| to stderr. This is intended for debugging; no output is produced on
+// failure.
+//
+//   page         - handle to a page.
+//   annot_index  - zero-based annotation index on |page|.
+//
+// Returns true if any NameTree content was printed.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFAnnot_DumpRichMediaAssetsNameTree(FPDF_PAGE page, int annot_index);
+
+// Experimental API.
+// Get the RichMedia Assets NameTree dump for the annotation at |annot_index|
+// on |page| as a UTF-8 string. The format matches
+// FPDFAnnot_DumpRichMediaAssetsNameTree() output.
+//
+//   page         - handle to a page.
+//   annot_index  - zero-based annotation index on |page|.
+//   buffer       - buffer for holding the UTF-8 string. Can be NULL.
+//   buflen       - length of the buffer in bytes. Can be 0.
+//
+// Returns the required length in bytes including the terminating NUL
+// character. If |buffer| is NULL or |buflen| is 0, no data is copied.
+FPDF_EXPORT unsigned long FPDF_CALLCONV
+FPDFAnnot_GetRichMediaAssetsNameTree(FPDF_PAGE page,
+                                     int annot_index,
+                                     char* buffer,
+                                     unsigned long buflen);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

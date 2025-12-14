@@ -292,6 +292,25 @@ FPDFAttachment_GetFile(FPDF_ATTACHMENT attachment,
 
   CPDF_FileSpec spec(pdfium::WrapRetain(pFile));
   RetainPtr<const CPDF_Stream> pFileStream = spec.GetFileStream();
+  if (!pFileStream && pFile->IsStream()) {
+    pFileStream = pdfium::WrapRetain(pFile->AsStream());
+  }
+  if (!pFileStream) {
+    if (const CPDF_Dictionary* dict = pFile->AsDictionary()) {
+      RetainPtr<const CPDF_Dictionary> ef_dict = dict->GetDictFor("EF");
+      if (ef_dict) {
+        CPDF_DictionaryLocker locker(ef_dict);
+        for (auto it = locker.begin(); it != locker.end(); ++it) {
+          RetainPtr<const CPDF_Stream> ef_stream =
+              ef_dict->GetStreamFor(it->first.AsStringView());
+          if (ef_stream) {
+            pFileStream = ef_stream;
+            break;
+          }
+        }
+      }
+    }
+  }
   if (!pFileStream) {
     return false;
   }
@@ -317,6 +336,25 @@ FPDFAttachment_GetSubtype(FPDF_ATTACHMENT attachment,
   auto buffer_span = UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen));
   CPDF_FileSpec spec(pdfium::WrapRetain(file));
   RetainPtr<const CPDF_Stream> file_stream = spec.GetFileStream();
+  if (!file_stream && file->IsStream()) {
+    file_stream = pdfium::WrapRetain(file->AsStream());
+  }
+  if (!file_stream) {
+    if (const CPDF_Dictionary* dict = file->AsDictionary()) {
+      RetainPtr<const CPDF_Dictionary> ef_dict = dict->GetDictFor("EF");
+      if (ef_dict) {
+        CPDF_DictionaryLocker locker(ef_dict);
+        for (auto it = locker.begin(); it != locker.end(); ++it) {
+          RetainPtr<const CPDF_Stream> ef_stream =
+              ef_dict->GetStreamFor(it->first.AsStringView());
+          if (ef_stream) {
+            file_stream = ef_stream;
+            break;
+          }
+        }
+      }
+    }
+  }
   if (!file_stream) {
     return Utf16EncodeMaybeCopyAndReturnLength(WideString(), buffer_span);
   }
