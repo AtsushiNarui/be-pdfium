@@ -209,6 +209,10 @@ source_set("fxge") {
     configs -= [ "//build/config/win:lean_and_mean" ]
   }
 
+  if (is_wasm) {
+    sources += [ "wasm/fx_wasm_platform.cpp" ]
+  }
+
   visibility = [ "../../*" ]
 }
 

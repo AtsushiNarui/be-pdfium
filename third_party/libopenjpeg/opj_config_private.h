@@ -21,7 +21,13 @@
 /* #undef _LARGEFILE_SOURCE */
 /* #undef _LARGE_FILES */
 /* #undef _FILE_OFFSET_BITS */
-#define OPJ_HAVE_FSEEKO ON
+#ifdef OPJ_HAVE_FSEEKO
+#undef OPJ_HAVE_FSEEKO
+#endif
+
+#if !defined(__EMSCRIPTEN__)
+#define OPJ_HAVE_FSEEKO
+#endif
 
 /* Byte order.  */
 /* All compilers that support Mac OS X define either __BIG_ENDIAN__ or

@@ -127,11 +127,18 @@ config("pdfium_common_config") {
 }
 
 config("pdfium_implementation_config") {
-  defines = [
-    "FPDF_IMPLEMENTATION",
-    "FPDF_EXPORT=__declspec(dllexport)",
-    "FPDF_CALLCONV=__stdcall",
-  ]
+  defines = [ "FPDF_IMPLEMENTATION" ]
+  if (is_wasm) {
+    defines += [
+      "FPDF_EXPORT=",
+      "FPDF_CALLCONV=",
+    ]
+  } else {
+    defines += [
+      "FPDF_EXPORT=__declspec(dllexport)",
+      "FPDF_CALLCONV=__stdcall",
+    ]
+  }
   if (is_win) {
     defines += [ "FPDFSDK_EXPORTS" ]
   }
@@ -465,7 +472,7 @@ group("gn_check") {
 
   # TODO(crbug.com/pdfium/1832): Remove !is_android when //third_party/expat is
   # available.
-  if (defined(checkout_skia) && checkout_skia && !is_android) {
+  if (defined(checkout_skia) && checkout_skia && !is_android && !is_wasm) {
     deps += [ "//skia" ]
   }
 }

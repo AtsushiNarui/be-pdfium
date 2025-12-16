@@ -11,6 +11,10 @@
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <sys/stat.h>
+#elif defined(__EMSCRIPTEN__)
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #else  // Linux
 #include <linux/limits.h>
 #include <sys/stat.h>
@@ -86,6 +90,10 @@ bool PathService::GetExecutableDir(std::string* path) {
   if (_NSGetExecutablePath(&((*path)[0]), &path_length)) {
     return false;
   }
+#elif defined(__EMSCRIPTEN__)
+  DCHECK(path);
+  // In Emscripten builds, treat the current working directory as the base.
+  *path = ".";
 #else   // Linux
   static const char kProcSelfExe[] = "/proc/self/exe";
   char buf[PATH_MAX];
